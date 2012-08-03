@@ -4,10 +4,12 @@ use Moose;
 
 use File::ChangeNotify;
 use File::Spec;
+use File::Temp qw/tempdir/;
 use Cwd qw/abs_path/;
 use YAML::Any qw/DumpFile LoadFile/;
+use POSIX;
 
-our $VERSION = '0.10';
+our $VERSION = '0.11';
 
 my @watcher_opts = qw/directories filter exclude follow_symlinks sleep_interval/;
 has 'watcher' => (
@@ -19,6 +21,16 @@ has 'statefilename' => (
     is => 'rw', 
     isa => 'Str', 
     default => '.filetaildirstate',
+    );
+has 'autostate' => (
+    is => 'rw',
+    isa => 'Bool',
+    default => 0,
+    );
+has 'autostate_delay' => (
+    is => 'rw',
+    isa => 'Int',
+    default => 0,
     );
 has 'no_init' => (
     is => 'ro',
@@ -59,6 +71,22 @@ has '_filehandles' => (
     default => sub { {} },
     );
 
+# private directory, used to trigger exit from watcher loop for auto state save
+has 'private_dir' => (
+    is => 'ro',
+    isa => 'Str',
+    );
+
+# PID of child watchdog process
+has '_child_pid' => (
+    is => 'rw',
+    );
+
+# list of temporary directories to clean up on exit
+my %cleanup_dirs;
+my %cleanup_pids;
+my $_dotfile = '.filetaildirwatchdog';
+
 around 'BUILDARGS' => sub {
     my $orig = shift;
     my $class = shift;
@@ -69,6 +97,16 @@ around 'BUILDARGS' => sub {
     my %watcher_opts;
     for ( @watcher_opts ) {
 	$watcher_opts{$_} = delete $args->{$_} if exists $args->{$_};
+    }
+    if (! $args->{watcher} && $args->{autostate} && $args->{autostate_delay}) {
+        # need to add a private directory to watch
+        $args->{private_dir} ||= tempdir(CLEANUP => 0);
+        push(@{$watcher_opts{directories}}, $args->{private_dir});
+        push(@{$cleanup_dirs{$$} ||= []}, $args->{private_dir});
+        # Add watchdog file to filter
+        if (defined $watcher_opts{filter}) {
+            $watcher_opts{filter} = qr/^\Q$_dotfile\E$|$watcher_opts{filter}/;
+        }
     }
     $args->{watcher} ||= File::ChangeNotify->instantiate_watcher(%watcher_opts);
 
@@ -349,29 +387,112 @@ sub watch_files {
     my $opts = shift;
 
     my $state = $self->_load_state;
-
+    my $dirty_state = 0;
+    my $last_state_save = 0;
     my $watcher = $self->watcher;
     $self->running(1);
+
+    my $watchdog_file = $self->_start_watchdog();
 
     while ( $self->running && (my @events = $watcher->wait_for_events()) ) { 
 	my $event_t = time();
 #	print "Got " . (scalar @events) . " events\n";
 	for my $e (@events) {
 #	    print "Event: " . $e->type . " on " . $e->path . "\n";
+#            print "Watchdog file is $watchdog_file\n";
 	    my $filename = abs_path($e->path);
-	    my ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks) = stat($filename);
+            if (! $watchdog_file || $filename ne $watchdog_file) {
+                my ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks) = stat($filename);
 
-	    if (defined($ino) && (! (defined $state->{$filename}) || $state->{$filename}{inode} != $ino)) {
-		# new or moved file
-		$self->_check_inode_data($filename, undef, $event_t);
-	    }
-	    $self->_process_event($filename, $event_t);
-
+                if (defined($ino) && (! (defined $state->{$filename}) || $state->{$filename}{inode} != $ino)) {
+                    # new or moved file
+                    $self->_check_inode_data($filename, undef, $event_t);
+                }
+                $self->_process_event($filename, $event_t);
+                $dirty_state++;
+            }
 	}
 	$self->_check_filehandles($event_t);
-	$self->_clear_inode_list();
+
+        if ($self->autostate && $last_state_save + $self->autostate_delay <= time()) {
+            $self->_feed_watchdog();
+            $self->save_state();
+            $last_state_save = time();
+            $dirty_state = 0;
+        }
+        else {
+            $self->_clear_inode_list();
+        }
     }
     $self->save_state();
+    $self->_stop_watchdog();
+}
+
+# starts another process which will touch private_dir to trigger an
+# exit from the wait_for_events() loop.
+sub _start_watchdog {
+    my $self = shift;
+
+    return unless $self->autostate && $self->autostate_delay;
+    my $delay = $self->autostate_delay;
+    my $filename = abs_path(File::Spec->catfile($self->private_dir, $_dotfile));
+
+    my $pid = fork();
+    if (! defined $pid) {
+        die "Fork failed: $!";
+    }
+    elsif ($pid) {
+        # parent
+        $self->_child_pid($pid);
+        push(@{$cleanup_pids{$$} ||= []}, $pid);
+        return $filename;
+    }
+
+    # child
+
+    # restart timer on USR1, which parent uses to signal that state has been saved
+    $SIG{USR1} = sub {
+        alarm $delay;
+    };
+
+    $SIG{ALRM} = sub {
+        open my $fh, '>', $filename or die "Failed to open $filename: $!";
+        print $fh time();
+        close($fh);
+        alarm $delay;
+    };
+
+    alarm $delay;
+
+    while (1) {
+        select undef, undef, undef, 1000;
+    }
+}
+
+sub _kill_watchdog {
+    my $self = shift;
+
+    if (my $pid = $self->_child_pid) {
+        kill SIGTERM, $pid;
+    }
+}
+
+sub _feed_watchdog {
+    my $self = shift;
+
+    if (my $pid = $self->_child_pid) {
+        kill SIGUSR1, $pid;
+    }
+}
+
+END {
+    for my $pid (@{$cleanup_pids{$$} || []}) {
+        kill SIGTERM, $pid;
+    }
+    for my $dir (@{$cleanup_dirs{$$} || []}) {
+        unlink File::Spec->catfile($dir, $_dotfile);
+        rmdir $dir;
+    }
 }
 
 no Moose;
@@ -538,6 +659,16 @@ seconds.  The default is 2 seconds.
 Sets the name of the file used to store state between sessions.  Defaults to
 '.filetaildirstate' in the working directory.
 
+=item * autostate => 1|0
+
+Set to 1 to automatically store the state file periodically. Defaults to 0.
+
+=item * autostate_delay => $number
+
+If autostate is enabled, sets the minimum delay in seconds between
+when the state file is automatically saved.  If set to 0, state is
+saved on every file change.
+
 =item * no_init => 1|0
 
 If no_init is set, the initial contents of the monitored files is skipped and
@@ -596,9 +727,11 @@ exited until a new file change event is seen.
 
   $tailer->save_state();
 
-Saves internal state to file.  This is always called when watch_files()
-completes normally.  However, you may wish to call it directly if you have
-installed a signal handler that might not allow watch_files() to complete.
+Saves internal state to file.  This is always called when
+watch_files() completes normally, and is called periodically if
+autostate is enabled.  However, you may wish to call it directly if
+you have installed a signal handler that might not allow watch_files()
+to complete.
 
 =head2 __PACKAGE__->install_signal_handlers
 
@@ -652,7 +785,7 @@ L<http://search.cpan.org/dist/File-Tail-Dir>
 
 =head1 COPYRIGHT & LICENSE
 
-Copyright 2010 Jon Schutz, all rights reserved.
+Copyright 2012 Jon Schutz, all rights reserved.
 
 This program is free software; you can redistribute it and/or modify it
 under the same terms as Perl itself.

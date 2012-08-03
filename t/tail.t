@@ -3,7 +3,7 @@
 use strict;
 use warnings;
 
-use Test::More tests => 13;
+use Test::More tests => 17;
 use File::Temp qw/tempdir/;
 use Digest::MD5 qw/md5_hex/;
 
@@ -24,6 +24,8 @@ END {
 my $dir = tempdir( CLEANUP => ($debug ? 0: 1));
 diag("Using temporary directory $dir\n") if $debug;
 chdir($dir);
+my $written_t;
+my $autostate_delay = 2;
 
 # Add some symlinks, including a circular reference
 eval {
@@ -39,7 +41,7 @@ eval {
 # third tests no state on existing dir; output.txt is removed and whole contents should be resent 
 # fourth tests no_init; nothing should be sent
 # In each case line count and checksums of output.txt should match sum of input files
-for my $phase (qw/initial subsequent no_state no_init/) {
+for my $phase (qw/initial subsequent no_state no_init autostate/) {
 # start watcher
     unlink(".filetaildirstate") if ($phase eq 'no_state');
     unlink("output.txt") if ($phase eq 'no_state');
@@ -51,6 +53,8 @@ for my $phase (qw/initial subsequent no_state no_init/) {
 					    processor => sub { my ($name, $lines) = @_; print $fh join("", @$lines); },
 					    follow_symlinks => 1,
 					    no_init => ($phase eq 'no_init'),
+                                            autostate => ($phase eq 'autostate'),
+                                            autostate_delay => $autostate_delay,
 		) or die "Failed to create File::Tail::Dir instance";
 	    $lw->watch_files();
 	});
@@ -93,6 +97,17 @@ for my $phase (qw/initial subsequent no_state no_init/) {
 	}
 # wait for writers to finish
 	waitpids(30, @src_pids);
+    }
+    elsif ($phase eq 'autostate') {
+        # write to one file to make the state dirty.
+        my $fname = 'input1.txt';
+        open my $fh, '>>', $fname or die "Failed to open $fname: $!";
+        print $fh join('', map { md5_hex($_) . " " . $_ . "\n" } ( 'blah' ));
+        close($fh);
+        $written_t = time();
+        sleep($autostate_delay + 1);
+        my ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime) = stat('.filetaildirstate');
+        ok($mtime > $written_t, "state file automatically updated");
     }
 
 # stop watcher
