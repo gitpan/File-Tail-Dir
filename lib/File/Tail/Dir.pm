@@ -9,7 +9,7 @@ use Cwd qw/abs_path/;
 use YAML::Any qw/DumpFile LoadFile/;
 use POSIX;
 
-our $VERSION = '0.11';
+our $VERSION = '0.12';
 
 my @watcher_opts = qw/directories filter exclude follow_symlinks sleep_interval/;
 has 'watcher' => (
@@ -52,6 +52,11 @@ has 'max_age' => (
     isa => 'Int',
     default => 3600,
     );
+has 'max_lines' => (
+    is => 'ro',
+    isa => 'Int',
+    default => 10000,
+    );
 has '_last_filehandle_check' => (
     is => 'rw',
     isa => 'Int',
@@ -86,6 +91,7 @@ has '_child_pid' => (
 my %cleanup_dirs;
 my %cleanup_pids;
 my $_dotfile = '.filetaildirwatchdog';
+
 
 around 'BUILDARGS' => sub {
     my $orig = shift;
@@ -369,14 +375,24 @@ sub _process_event {
     my $eollen = length($eol);
 
     if (my $fh = $self->_get_filehandle($filename)) {
-	if (my @lines = readline($fh)) {
-	    # backtrack to last complete line if necessary
-	    if ((my $ch = substr($lines[-1], length($lines[-1]) - $eollen, $eollen)) ne $eol) {
-		seek($fh, -length($lines[-1]), 1);
-		pop @lines;
-	    }
-	    $self->process($filename, \@lines) if @lines;
-	}
+        while (1) {
+            my @lines;
+            while (my $line = <$fh>) {
+                push(@lines, $line);
+                last if @lines > $self->max_lines;
+            }
+            if (@lines) {
+                # backtrack to last complete line if necessary
+                if ((my $ch = substr($lines[-1], length($lines[-1]) - $eollen, $eollen)) ne $eol) {
+                    seek($fh, -length($lines[-1]), 1);
+                    pop @lines;
+                }
+                $self->process($filename, \@lines) if @lines;
+            }
+            else {
+                last;
+            }
+        }
 	$self->_update_state($filename, $event_t);
     }
 
@@ -684,6 +700,13 @@ contents of those files before monitoring for new changes.
 
 Maximum time in seconds to keep a filehandle open if no changes on the
 filehandle have been seen.  Defaults to 3600 sec.
+
+=item * max_lines => $number
+
+Maximum number of lines to process from a given file at a time.  This
+sets a limit on the maximum amount of memory to use, particularly in
+the case of processing large files for the first time.  Defaults to
+10000.
 
 =back
 
