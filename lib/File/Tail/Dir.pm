@@ -1,6 +1,7 @@
 package File::Tail::Dir;
 
 use Moose;
+use Moose::Util::TypeConstraints;
 
 use File::ChangeNotify;
 use File::Spec;
@@ -8,8 +9,18 @@ use File::Temp qw/tempdir/;
 use Cwd qw/abs_path/;
 use YAML::Any qw/DumpFile LoadFile/;
 use POSIX;
+use Config;
+use Time::HiRes qw/time/;
 
-our $VERSION = '0.12';
+our $VERSION = '0.14';
+
+my @sig_names = map { split /\s+/ } $Config{sig_name};
+my @sig_nums = map { split /\s+/ } $Config{sig_num};
+my %signals;
+for (my $i = 0; $i < @sig_names; $i++) {
+    $signals{$sig_names[$i]} = $sig_nums[$i];
+}
+enum 'SIGNAME', [ keys %signals ];
 
 my @watcher_opts = qw/directories filter exclude follow_symlinks sleep_interval/;
 has 'watcher' => (
@@ -21,6 +32,11 @@ has 'statefilename' => (
     is => 'rw', 
     isa => 'Str', 
     default => '.filetaildirstate',
+    );
+has 'watchdog_signal_name' => ( 
+    is => 'ro', 
+    isa => 'SIGNAME', 
+    default => sub { $^O =~ m/MSWin/ ? 'INT' : 'USR1' },
     );
 has 'autostate' => (
     is => 'rw',
@@ -59,7 +75,7 @@ has 'max_lines' => (
     );
 has '_last_filehandle_check' => (
     is => 'rw',
-    isa => 'Int',
+    isa => 'Num',
     default => sub { time() },
     );
 has '_state' => (
@@ -124,9 +140,17 @@ my $signal_handlers_installed = 0;
 
 sub install_signal_handlers {
     for (qw/HUP INT QUIT TERM/) {
+	next unless defined $signals{$_};
 	$SIG{$_} = \&_save_and_exit;
     }
     $signal_handlers_installed = 1;
+}
+
+sub uninstall_signal_handlers {
+    for (qw/HUP INT QUIT TERM/) {
+	delete $SIG{$_};
+    }
+    $signal_handlers_installed = 0;
 }
 
 sub BUILD {
@@ -137,7 +161,18 @@ sub _save_and_exit {
     while (my $self  = shift(@instances)) {
 	$self->save_state if $self->running;
     }
+    cleanup_processes();
     exit();
+}
+
+sub cleanup_processes {
+    for my $pid (@{$cleanup_pids{$$} || []}) {
+        kill SIGTERM, $pid;
+    }
+    for my $dir (@{$cleanup_dirs{$$} || []}) {
+        unlink File::Spec->catfile($dir, $_dotfile);
+        rmdir $dir;
+    }
 }
 
 END {
@@ -451,7 +486,8 @@ sub _start_watchdog {
 
     return unless $self->autostate && $self->autostate_delay;
     my $delay = $self->autostate_delay;
-    my $filename = abs_path(File::Spec->catfile($self->private_dir, $_dotfile));
+    my $filename = _touch(File::Spec->catfile($self->private_dir, $_dotfile));
+    $self->{_sig_no} = $signals{$self->watchdog_signal_name};
 
     my $pid = fork();
     if (! defined $pid) {
@@ -466,15 +502,16 @@ sub _start_watchdog {
 
     # child
 
+    $0 = '(watchdog) ' . $0;
+    uninstall_signal_handlers();
+
     # restart timer on USR1, which parent uses to signal that state has been saved
-    $SIG{USR1} = sub {
+    $SIG{$self->watchdog_signal_name} = sub {
         alarm $delay;
     };
 
     $SIG{ALRM} = sub {
-        open my $fh, '>', $filename or die "Failed to open $filename: $!";
-        print $fh time();
-        close($fh);
+	_touch($filename);
         alarm $delay;
     };
 
@@ -485,6 +522,16 @@ sub _start_watchdog {
     }
 }
 
+# touch and return absolute filename 
+# (Windows abs_path requires file to exist, rt.cpan.org #80457)
+sub _touch {
+    my $filename = shift;
+    open my $fh, '>', $filename or die "Failed to open $filename: $!";
+    print $fh time();
+    close($fh);
+    return abs_path($filename);
+}
+  
 sub _kill_watchdog {
     my $self = shift;
 
@@ -497,17 +544,7 @@ sub _feed_watchdog {
     my $self = shift;
 
     if (my $pid = $self->_child_pid) {
-        kill SIGUSR1, $pid;
-    }
-}
-
-END {
-    for my $pid (@{$cleanup_pids{$$} || []}) {
-        kill SIGTERM, $pid;
-    }
-    for my $dir (@{$cleanup_dirs{$$} || []}) {
-        unlink File::Spec->catfile($dir, $_dotfile);
-        rmdir $dir;
+        kill $self->{_sig_no}, $pid;
     }
 }
 
@@ -707,6 +744,10 @@ Maximum number of lines to process from a given file at a time.  This
 sets a limit on the maximum amount of memory to use, particularly in
 the case of processing large files for the first time.  Defaults to
 10000.
+
+=item * watchdog_signal_name
+
+Name of signal to use for watchdog.  Defaults to USR1 on most systems, INT on Windows.
 
 =back
 
