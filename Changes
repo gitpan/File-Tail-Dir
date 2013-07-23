@@ -14,3 +14,6 @@ Revision history for File-Tail-Dir
 
 0.14	2012-11-02
 	rt.cpan.org #80457 Issues on Windows 7
+
+0.15    2013-07-23
+        Fixed problem with infinite loop while reading file that has no final carriage return.

@@ -12,7 +12,7 @@ use POSIX;
 use Config;
 use Time::HiRes qw/time/;
 
-our $VERSION = '0.14';
+our $VERSION = '0.15';
 
 my @sig_names = map { split /\s+/ } $Config{sig_name};
 my @sig_nums = map { split /\s+/ } $Config{sig_num};
@@ -418,11 +418,14 @@ sub _process_event {
             }
             if (@lines) {
                 # backtrack to last complete line if necessary
+                my $partial = 0;
                 if ((my $ch = substr($lines[-1], length($lines[-1]) - $eollen, $eollen)) ne $eol) {
                     seek($fh, -length($lines[-1]), 1);
                     pop @lines;
+                    $partial++;
                 }
                 $self->process($filename, \@lines) if @lines;
+                last if $partial;
             }
             else {
                 last;
