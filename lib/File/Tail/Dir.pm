@@ -12,7 +12,7 @@ use POSIX;
 use Config;
 use Time::HiRes qw/time/;
 
-our $VERSION = '0.15';
+our $VERSION = '0.16';
 
 my @sig_names = map { split /\s+/ } $Config{sig_name};
 my @sig_nums = map { split /\s+/ } $Config{sig_num};
@@ -534,7 +534,11 @@ sub _touch {
     close($fh);
     return abs_path($filename);
 }
-  
+
+sub _stop_watchdog {
+    shift->_kill_watchdog;
+}
+
 sub _kill_watchdog {
     my $self = shift;
 

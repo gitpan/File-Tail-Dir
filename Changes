@@ -17,3 +17,6 @@ Revision history for File-Tail-Dir
 
 0.15    2013-07-23
         Fixed problem with infinite loop while reading file that has no final carriage return.
+
+0.16    2013-09-27
+        rt.cpan.org #88995 Fixed missing method _stop_watchdog
